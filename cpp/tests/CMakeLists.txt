@@ -1,6 +1,6 @@
 # =============================================================================
 # cmake-format: off
-# SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # cmake-format: on
 # =============================================================================
@@ -156,6 +156,9 @@ ConfigureTest(THREAD_SAFE_MR_REF_TEST mr/mr_ref_thread_safe_tests.cpp GPUS 1 PER
 ConfigureTest(POOL_MR_TEST mr/pool_mr_tests.cpp GPUS 1 PERCENT 100)
 ConfigureTest(POOL_MR_REF_TEST mr/mr_ref_pool_tests.cpp GPUS 1 PERCENT 100)
 ConfigureTest(PINNED_POOL_MR_REF_TEST mr/mr_ref_pinned_pool_tests.cpp)
+
+# host-writable pinned allocation tests
+ConfigureTest(HOST_WRITABLE_TEST mr/host_writable_tests.cu GPUS 1 PERCENT 100)
 
 ConfigureTest(HWDECOMPRESS_TEST mr/hwdecompress_tests.cpp LINK_DRIVER)
 

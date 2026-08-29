@@ -28,5 +28,46 @@ device_async_resource_ref pool_memory_resource::get_upstream_resource() const no
 
 std::size_t pool_memory_resource::pool_size() const noexcept { return get().pool_size(); }
 
+void* pool_memory_resource::allocate_host_writable(cuda::stream_ref stream,
+                                                   std::size_t bytes,
+                                                   std::size_t alignment)
+{
+  return get().allocate_host_writable(stream, bytes, alignment);
+}
+
+void pool_memory_resource::deallocate_host_writable(cuda::stream_ref stream,
+                                                    void* ptr,
+                                                    std::size_t bytes,
+                                                    std::size_t alignment,
+                                                    bool device_exposed) noexcept
+{
+  get().deallocate_host_writable(stream, ptr, bytes, alignment, device_exposed);
+}
+
+void pool_memory_resource::set_host_write_sync_mode(host_write_sync_mode mode) noexcept
+{
+  get().set_host_write_sync_mode(mode);
+}
+
+void pool_memory_resource::set_skip_stream_event_record(bool skip) noexcept
+{
+  get().set_skip_stream_event_record(skip);
+}
+
+void pool_memory_resource::set_block_event_ring_size(std::size_t size) noexcept
+{
+  get().set_block_event_ring_size(size);
+}
+
+host_writable_stats pool_memory_resource::host_writable_statistics()
+{
+  return get().host_writable_statistics();
+}
+
+void pool_memory_resource::reset_host_writable_statistics()
+{
+  get().reset_host_writable_statistics();
+}
+
 }  // namespace mr
 RMM_NAMESPACE_END

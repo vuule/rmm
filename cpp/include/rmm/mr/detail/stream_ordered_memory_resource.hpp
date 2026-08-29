@@ -10,16 +10,22 @@
 #include <rmm/detail/export.hpp>
 #include <rmm/detail/format.hpp>
 #include <rmm/logger.hpp>
+#include <rmm/mr/detail/event_pool.hpp>
+#include <rmm/mr/host_writable.hpp>
 #include <rmm/process_is_exiting.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 #ifdef RMM_DEBUG_PRINT
 #include <iostream>
 #endif
@@ -42,6 +48,18 @@ template <typename T>
 struct crtp {
   [[nodiscard]] T& underlying() { return static_cast<T&>(*this); }
   [[nodiscard]] T const& underlying() const { return static_cast<T const&>(*this); }
+};
+
+/**
+ * @brief Whether a block type can carry a completion event for host-writable allocation.
+ *
+ * `coalescing_free_list`'s block does; the plain `block_base` used by fixed-size free lists does
+ * not, so pools built on it fall back to the per-stream event.
+ */
+template <typename BlockType>
+concept tracks_free_event = requires(BlockType& block, cudaEvent_t event, std::uint64_t seq) {
+  block.set_free_event(event, seq);
+  { std::as_const(block).free_event() } -> std::convertible_to<cudaEvent_t>;
 };
 
 /**
@@ -187,6 +205,185 @@ class stream_ordered_memory_resource : public crtp<PoolResource> {
     auto const stream = cuda::stream_ref{cudaStream_t{nullptr}};
     deallocate(stream, ptr, bytes, alignment);
     RMM_ASSERT_CUDA_SUCCESS_SAFE_SHUTDOWN(cudaStreamSynchronize(stream.get()));
+  }
+
+  /**
+   * @brief Allocates memory of at least `bytes` bytes that the host may write to on return.
+   *
+   * Equivalent to `allocate`, except that on return it is safe for the calling thread to write to
+   * the returned memory without any further synchronization. A pool can recycle a block whose
+   * previous owner still has a copy in flight on the stream it was freed on; this entry point
+   * performs the minimal wait that guarantees such a copy has completed, rather than requiring the
+   * caller to synchronize the whole stream.
+   *
+   * The wait is performed without holding the pool lock.
+   *
+   * @throws `std::bad_alloc` if the requested allocation could not be fulfilled
+   *
+   * @param stream The stream in which to order this allocation
+   * @param bytes The size in bytes of the allocation
+   * @param alignment Unused; alignment is always at least `CUDA_ALLOCATION_ALIGNMENT`
+   * @return void* Pointer to memory the host may write to immediately
+   */
+  [[nodiscard]] void* allocate_host_writable(cuda::stream_ref stream,
+                                             std::size_t bytes,
+                                             std::size_t alignment)
+  {
+    if (bytes == 0) { return nullptr; }
+
+    auto const strm = cuda_stream_view{stream};
+
+    if (host_write_mode_ == host_write_sync_mode::stream_sync) {
+      void* ptr = allocate(stream, bytes, alignment);
+      {
+        lock_guard lock(mtx_);
+        ++hw_stats_.allocations;
+        ++hw_stats_.waits;
+      }
+      RMM_CUDA_TRY(cudaStreamSynchronize(strm.value()));
+      return ptr;
+    }
+
+    void* ptr{};
+    cudaEvent_t wait_event{};
+    {
+      lock_guard lock(mtx_);
+
+      auto const stream_event = get_event(strm);
+      auto const aligned      = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+      RMM_EXPECTS(aligned <= this->underlying().get_maximum_allocation_size(),
+                  std::string("Maximum allocation size exceeded (failed to allocate ") +
+                    rmm::detail::format_bytes(aligned) + ")",
+                  rmm::out_of_memory);
+
+      // `get_block` reports through `cross_stream_wait_event_` when it takes a block from another
+      // stream, because in that case it only orders our *stream* behind the donor's event.
+      cross_stream_wait_event_ = nullptr;
+      auto const block         = this->underlying().get_block(aligned, stream_event);
+      ptr                      = block.pointer();
+
+      if (cross_stream_wait_event_ != nullptr) {
+        wait_event = cross_stream_wait_event_;
+      } else if constexpr (tracks_free_event<block_type>) {
+        if (per_block_events_enabled()) {
+          // Null when the block has never been freed, i.e. it came straight from upstream.
+          wait_event = block.free_event();
+        } else {
+          wait_event = stream_event.event;
+        }
+      } else {
+        // No new machinery: the per-stream event was last recorded at the most recent free on
+        // this stream, which is at or after the free of this block.
+        wait_event = stream_event.event;
+      }
+
+      ++hw_stats_.allocations;
+      if (wait_event == nullptr) {
+        ++hw_stats_.fast_path;
+      } else {
+        ++hw_stats_.waits;
+      }
+    }
+
+    if (wait_event != nullptr) {
+      // An event that has already completed still costs a driver round trip to synchronize on.
+      // Query first so the common already-idle case stays off that path.
+      if (cudaEventQuery(wait_event) == cudaSuccess) {
+        lock_guard lock(mtx_);
+        ++hw_stats_.query_short_circuit;
+      } else {
+        RMM_CUDA_TRY(cudaEventSynchronize(wait_event));
+      }
+    }
+    return ptr;
+  }
+
+  /**
+   * @brief Deallocates memory allocated by `allocate_host_writable`.
+   *
+   * @param stream The stream in which to order this deallocation
+   * @param ptr Pointer to be deallocated
+   * @param bytes The size in bytes of the allocation to deallocate
+   * @param alignment Unused
+   * @param device_exposed Whether this memory was ever used by device work on `stream`, e.g. as
+   * the source or destination of a copy. When false, a subsequent host writer needs no wait at
+   * all. Defaults to true, which is always safe.
+   */
+  void deallocate_host_writable(cuda::stream_ref stream,
+                                void* ptr,
+                                std::size_t bytes,
+                                std::size_t /*alignment*/,
+                                bool device_exposed = true) noexcept
+  {
+    if (bytes == 0 || ptr == nullptr) { return; }
+
+    auto const strm = cuda_stream_view{stream};
+
+    lock_guard lock(mtx_);
+    auto const stream_event = get_event(strm);
+
+    auto const aligned = rmm::align_up(bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+    auto block         = this->underlying().free_block(ptr, aligned);
+
+    if constexpr (tracks_free_event<block_type>) {
+      bool const track_clean = host_write_mode_ == host_write_sync_mode::clean_tracking;
+      if (track_clean && !device_exposed) {
+        // Nothing was ever queued against this block, so no event is needed and none is recorded.
+        // Blocks it coalesces with keep their own events, which is what a later waiter needs.
+        block.set_free_event(nullptr, 0);
+        stream_free_blocks_[stream_event].insert(block);
+        return;
+      }
+    }
+
+    if (!skip_stream_event_record_) {
+      RMM_ASSERT_CUDA_SUCCESS(cudaEventRecord(stream_event.event, strm.value()));
+      ++hw_stats_.event_records;
+    }
+
+    if constexpr (tracks_free_event<block_type>) {
+      if (per_block_events_enabled()) {
+        auto const event = next_block_event(stream_event.event);
+        RMM_ASSERT_CUDA_SUCCESS(cudaEventRecord(event, strm.value()));
+        ++hw_stats_.event_records;
+        block.set_free_event(event, ++free_seq_);
+      }
+    }
+
+    stream_free_blocks_[stream_event].insert(block);
+  }
+
+  /// Selects the mechanism used by `allocate_host_writable`. For evaluating the alternatives.
+  void set_host_write_sync_mode(host_write_sync_mode mode) noexcept { host_write_mode_ = mode; }
+
+  /**
+   * @brief Suppresses the shared per-stream `cudaEventRecord` on the host-writable deallocate path.
+   *
+   * Only for isolating the cost of that record. Unsafe in general: the device-side cross-stream
+   * reuse logic relies on the per-stream event being current.
+   */
+  void set_skip_stream_event_record(bool skip) noexcept { skip_stream_event_record_ = skip; }
+
+  /// Sets how many events are cycled per stream for per-block tracking.
+  void set_block_event_ring_size(std::size_t size) noexcept
+  {
+    block_event_ring_size_ = std::max<std::size_t>(size, 1);
+  }
+
+  /// Returns counters describing `allocate_host_writable` behavior.
+  [[nodiscard]] host_writable_stats host_writable_statistics()
+  {
+    lock_guard lock(mtx_);
+    auto stats           = hw_stats_;
+    stats.events_created = block_event_pool_.events_created();
+    return stats;
+  }
+
+  /// Resets the counters returned by `host_writable_statistics`.
+  void reset_host_writable_statistics()
+  {
+    lock_guard lock(mtx_);
+    hw_stats_ = host_writable_stats{};
   }
 
  protected:
@@ -347,6 +544,32 @@ class stream_ordered_memory_resource : public crtp<PoolResource> {
     }();
   }
 
+  /// Whether the current mode tracks a completion event per block rather than per stream.
+  [[nodiscard]] bool per_block_events_enabled() const noexcept
+  {
+    return host_write_mode_ == host_write_sync_mode::block_event ||
+           host_write_mode_ == host_write_sync_mode::clean_tracking;
+  }
+
+  /**
+   * @brief Returns the next event to use for per-block tracking on the stream owning
+   * `stream_event`.
+   *
+   * Events are cycled through a fixed-size ring per stream. Reusing an event re-records it at a
+   * later position on the same stream, so a block still referring to it waits for at least its own
+   * free position: stale tags over-wait but stay correct.
+   */
+  cudaEvent_t next_block_event(cudaEvent_t stream_event)
+  {
+    auto& ring = block_event_rings_[stream_event];
+    if (ring.events.size() < block_event_ring_size_) {
+      ring.events.push_back(block_event_pool_.acquire());
+    }
+    auto const event = ring.events[ring.next % ring.events.size()];
+    ++ring.next;
+    return event;
+  }
+
   /**
    * @brief Splits a block into an allocated block of `size` bytes and a remainder block, and
    * inserts the remainder into a free list.
@@ -442,6 +665,9 @@ class stream_ordered_memory_resource : public crtp<PoolResource> {
           // Since we found a block associated with a different stream, we have to insert a wait
           // on the stream's associated event into the allocating stream.
           RMM_CUDA_TRY(cudaStreamWaitEvent(stream_event.stream, other_event, 0));
+          // That wait orders our stream, not the calling host thread. A host writer must wait on
+          // the donor's event itself.
+          cross_stream_wait_event_ = other_event;
           return allocate_and_insert_remainder(block, size, other_blocks);
         }
       }
@@ -487,6 +713,21 @@ class stream_ordered_memory_resource : public crtp<PoolResource> {
     // (a cross-stream steal or merge, or `release()`) transitively wait on `other_event`,
     // and therefore on any work still in flight on the donor stream.
     RMM_CUDA_TRY(cudaEventRecord(stream_event.event, stream_event.stream));
+
+    // Per-block events are only comparable by sequence number within one stream, and this list now
+    // holds blocks freed on two. The record above is ordered after the wait on `other_event`, so
+    // re-tagging every block with it restores that invariant without any further synchronization.
+    if constexpr (tracks_free_event<block_type>) {
+      if (per_block_events_enabled()) {
+        auto const seq = ++free_seq_;
+        for (auto& blk : blocks) {
+          blk.set_free_event(stream_event.event, seq);
+        }
+      }
+    }
+
+    // A host writer taking a block from this list must wait on the re-recorded event.
+    cross_stream_wait_event_ = stream_event.event;
   }
 
   /**
@@ -540,6 +781,21 @@ class stream_ordered_memory_resource : public crtp<PoolResource> {
   std::unordered_map<stream_id_type, stream_event_pair> stream_events_;
 
   std::mutex mtx_;  // mutex for thread-safe access
+
+  /// A fixed-size ring of events cycled for per-block completion tracking on one stream.
+  struct event_ring {
+    std::vector<cudaEvent_t> events;
+    std::size_t next{0};
+  };
+
+  host_write_sync_mode host_write_mode_{host_write_sync_mode::stream_sync};
+  bool skip_stream_event_record_{false};
+  std::size_t block_event_ring_size_{64};
+  event_pool block_event_pool_;
+  std::map<cudaEvent_t, event_ring> block_event_rings_;
+  std::uint64_t free_seq_{};
+  cudaEvent_t cross_stream_wait_event_{};
+  host_writable_stats hw_stats_{};
 
   rmm::cuda_device_id device_id_{rmm::get_current_cuda_device()};
 };  // namespace detail

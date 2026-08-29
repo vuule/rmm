@@ -9,9 +9,12 @@
 #include <rmm/detail/export.hpp>
 #include <rmm/mr/detail/free_list.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #ifdef RMM_DEBUG_PRINT
 #include <iostream>
 #endif
@@ -29,6 +32,10 @@ struct block : public block_base {
   block() = default;
   block(char* ptr, std::size_t size, bool is_head)
     : block_base{ptr}, size_bytes{size}, head{is_head}
+  {
+  }
+  block(char* ptr, std::size_t size, bool is_head, cudaEvent_t event, std::uint64_t seq)
+    : block_base{ptr}, size_bytes{size}, head{is_head}, free_event_{event}, free_seq_{seq}
   {
   }
 
@@ -78,7 +85,29 @@ struct block : public block_base {
   [[nodiscard]] inline block merge(block const& blk) const noexcept
   {
     assert(is_contiguous_before(blk));
-    return {pointer(), size() + blk.size(), is_head()};
+    // Blocks in a single free list were all freed on the same stream, so the event recorded
+    // latest on that stream subsumes every earlier one. Keeping only that event is therefore
+    // sufficient for a host waiter on the coalesced block.
+    auto const& later = (blk.free_seq_ > free_seq_) ? blk : *this;
+    return {pointer(), size() + blk.size(), is_head(), later.free_event_, later.free_seq_};
+  }
+
+  /**
+   * @brief Returns the event recording the completion of work on this block's freeing stream.
+   *
+   * Null if this block has never been freed (i.e. it came straight from upstream), in which case
+   * no wait is needed before the host writes to it.
+   */
+  [[nodiscard]] inline cudaEvent_t free_event() const noexcept { return free_event_; }
+
+  /// Returns the monotonic sequence number of the record of `free_event()`.
+  [[nodiscard]] inline std::uint64_t free_seq() const noexcept { return free_seq_; }
+
+  /// Associates a completion event with this block. See `free_event()`.
+  inline void set_free_event(cudaEvent_t event, std::uint64_t seq) noexcept
+  {
+    free_event_ = event;
+    free_seq_   = seq;
   }
 
   /**
@@ -123,8 +152,10 @@ struct block : public block_base {
 #endif
 
  private:
-  std::size_t size_bytes{};  ///< Size in bytes
-  bool head{};               ///< Indicates whether ptr was allocated from the heap
+  std::size_t size_bytes{};   ///< Size in bytes
+  bool head{};                ///< Indicates whether ptr was allocated from the heap
+  cudaEvent_t free_event_{};  ///< Completion of work on the stream this block was freed on
+  std::uint64_t free_seq_{};  ///< Monotonic sequence number of the `free_event_` record
 };
 
 #ifdef RMM_DEBUG_PRINT

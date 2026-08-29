@@ -1,6 +1,6 @@
 # =============================================================================
 # cmake-format: off
-# SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # cmake-format: on
 # =============================================================================
@@ -79,3 +79,6 @@ ConfigureBench(MULTI_STREAM_ALLOCATIONS_BENCH
 
 # async priming benchmark
 ConfigureBench(ASYNC_PRIMING_BENCH async_priming/async_priming_bench.cpp)
+
+# host-writable pinned allocation benchmark
+ConfigureBench(HOST_WRITABLE_BENCH host_writable/host_writable_bench.cu)

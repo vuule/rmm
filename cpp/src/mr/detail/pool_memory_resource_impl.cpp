@@ -193,14 +193,21 @@ pool_memory_resource_impl::block_type pool_memory_resource_impl::block_from_upst
 pool_memory_resource_impl::split_block pool_memory_resource_impl::allocate_from_block(
   block_type const& block, std::size_t size)
 {
-  block_type const alloc{block.pointer(), size, block.is_head()};
+  // Both halves inherit the completion event: the allocated half so a host writer can wait on it,
+  // and the remainder because it is still subject to whatever work the event records.
+  block_type const alloc{
+    block.pointer(), size, block.is_head(), block.free_event(), block.free_seq()};
 #ifdef RMM_POOL_TRACK_ALLOCATIONS
   allocated_blocks_.insert(alloc);
 #endif
 
   auto rest = (block.size() > size)
                 // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-                ? block_type{block.pointer() + size, block.size() - size, false}
+                ? block_type{block.pointer() + size,
+                             block.size() - size,
+                             false,
+                             block.free_event(),
+                             block.free_seq()}
                 : block_type{};
   return {alloc, rest};
 }

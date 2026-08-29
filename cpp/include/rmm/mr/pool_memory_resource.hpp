@@ -4,8 +4,10 @@
  */
 #pragma once
 
+#include <rmm/aligned.hpp>
 #include <rmm/detail/export.hpp>
 #include <rmm/mr/detail/pool_memory_resource_impl.hpp>
+#include <rmm/mr/host_writable.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/memory_resource>
@@ -76,6 +78,79 @@ class RMM_EXPORT pool_memory_resource
    * @return std::size_t The total size of the currently allocated pool.
    */
   [[nodiscard]] std::size_t pool_size() const noexcept;
+
+  /**
+   * @brief Allocates memory of at least `bytes` bytes that the host may write to on return.
+   *
+   * Unlike `allocate`, the calling thread may write to the returned memory immediately with no
+   * further synchronization. The pool may recycle a block whose previous owner still has a copy in
+   * flight on the stream it was freed on; this performs the minimal wait for that copy rather than
+   * requiring the caller to synchronize the whole stream.
+   *
+   * Memory returned by this function must be freed with `deallocate_host_writable`.
+   *
+   * @throws rmm::out_of_memory if the requested allocation could not be fulfilled
+   *
+   * @param stream The stream in which to order this allocation
+   * @param bytes The size in bytes of the allocation
+   * @param alignment Unused; alignment is always at least `CUDA_ALLOCATION_ALIGNMENT`
+   * @return void* Pointer to memory the host may write to immediately
+   */
+  [[nodiscard]] void* allocate_host_writable(cuda::stream_ref stream,
+                                             std::size_t bytes,
+                                             std::size_t alignment = CUDA_ALLOCATION_ALIGNMENT);
+
+  /**
+   * @brief Deallocates memory returned by `allocate_host_writable`.
+   *
+   * @param stream The stream in which to order this deallocation
+   * @param ptr Pointer to be deallocated
+   * @param bytes The size in bytes of the allocation to deallocate
+   * @param alignment Unused
+   * @param device_exposed Whether the memory was ever used by device work on `stream`. When false,
+   * a later host writer needs no wait at all. Defaults to true, which is always safe.
+   */
+  void deallocate_host_writable(cuda::stream_ref stream,
+                                void* ptr,
+                                std::size_t bytes,
+                                std::size_t alignment = CUDA_ALLOCATION_ALIGNMENT,
+                                bool device_exposed   = true) noexcept;
+
+  /**
+   * @brief Selects the mechanism used by `allocate_host_writable`.
+   *
+   * For evaluating the alternatives; a released version would settle on one.
+   *
+   * @param mode The mechanism to use
+   */
+  void set_host_write_sync_mode(host_write_sync_mode mode) noexcept;
+
+  /**
+   * @brief Suppresses the shared per-stream event record on the host-writable deallocate path.
+   *
+   * Only for isolating the cost of that record. Unsafe in general: the device-side cross-stream
+   * reuse logic relies on the per-stream event being current.
+   *
+   * @param skip Whether to skip the per-stream event record
+   */
+  void set_skip_stream_event_record(bool skip) noexcept;
+
+  /**
+   * @brief Sets how many events are cycled per stream for per-block completion tracking.
+   *
+   * @param size The number of events in the per-stream ring
+   */
+  void set_block_event_ring_size(std::size_t size) noexcept;
+
+  /**
+   * @brief Returns counters describing `allocate_host_writable` behavior.
+   *
+   * @return Counters accumulated since construction or the last reset
+   */
+  [[nodiscard]] host_writable_stats host_writable_statistics();
+
+  /// Resets the counters returned by `host_writable_statistics`.
+  void reset_host_writable_statistics();
 };
 
 static_assert(cuda::mr::resource_with<pool_memory_resource, cuda::mr::device_accessible>,
